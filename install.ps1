@@ -1,92 +1,217 @@
 # ══════════════════════════════════════════════════════════════
-#  Open Agents — One-Line Installer (Windows PowerShell)
+#  Open Agents — Fully Automatic Installer (Windows PowerShell)
 #
 #  Usage:
 #    irm https://raw.githubusercontent.com/robit-man/oa-install/main/install.ps1 | iex
 #
-#  Requires: Docker Desktop for Windows (with WSL2 backend)
+#  Handles EVERYTHING automatically:
+#    1. Elevates to admin if needed (UAC prompt)
+#    2. Enables WSL2 if not present
+#    3. Installs Docker Desktop if missing
+#    4. Starts Docker Desktop and waits for daemon
+#    5. Installs NVIDIA Container Toolkit if GPU present
+#    6. Builds OA Docker image
+#    7. Creates oa-docker launcher
+#    8. Launches OA
 # ══════════════════════════════════════════════════════════════
-
-$ErrorActionPreference = "Stop"
 
 $OA_MODEL = if ($env:OA_MODEL) { $env:OA_MODEL } else { "qwen3:4b" }
 $OA_VERSION = if ($env:OA_VERSION) { $env:OA_VERSION } else { "latest" }
 $OA_WORKSPACE = if ($env:OA_WORKSPACE) { $env:OA_WORKSPACE } else { "$env:USERPROFILE\oa-workspace" }
 $IMAGE_NAME = "open-agents"
 
-Write-Host "`n  Open Agents - Docker Installer (Windows)" -ForegroundColor Cyan
-Write-Host "  ========================================`n" -ForegroundColor Cyan
-
-# ── Step 1: Check Docker CLI exists ──
-try {
-    $dockerVersion = (docker --version 2>&1) | Out-String
-    Write-Host "Docker CLI: $($dockerVersion.Trim())" -ForegroundColor Green
-} catch {
-    Write-Host "ERROR: Docker Desktop is not installed." -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Install Docker Desktop from:" -ForegroundColor Yellow
-    Write-Host "  https://docs.docker.com/desktop/install/windows-install/" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "During installation, enable the WSL2 backend." -ForegroundColor Yellow
-    Write-Host "After installing, restart your terminal and re-run this script."
-    exit 1
+# ── Helper: check if running as admin ──
+function Test-Admin {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# ── Step 2: Check Docker daemon is actually running ──
-Write-Host "Checking Docker daemon..." -ForegroundColor Yellow
-try {
-    $info = docker info 2>&1 | Out-String
-    if ($info -match "error|Cannot connect|pipe") {
-        throw "Docker daemon not running"
-    }
-    Write-Host "Docker daemon: running" -ForegroundColor Green
-} catch {
-    Write-Host ""
-    Write-Host "ERROR: Docker Desktop is installed but the Docker Engine is not running." -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Fix:" -ForegroundColor Yellow
-    Write-Host "  1. Open Docker Desktop from the Start Menu" -ForegroundColor White
-    Write-Host "  2. Wait for the whale icon in the system tray to say 'Docker Desktop is running'" -ForegroundColor White
-    Write-Host "  3. If it says 'starting...', wait 30-60 seconds for it to finish" -ForegroundColor White
-    Write-Host "  4. Re-run this command:" -ForegroundColor White
-    Write-Host "     irm https://raw.githubusercontent.com/robit-man/oa-install/main/install.ps1 | iex" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "If Docker Desktop won't start:" -ForegroundColor Yellow
-    Write-Host "  - Open PowerShell as Administrator and run: wsl --update" -ForegroundColor White
-    Write-Host "  - Ensure WSL2 is enabled: wsl --set-default-version 2" -ForegroundColor White
-    Write-Host "  - Restart your computer, then try again" -ForegroundColor White
-    Write-Host ""
-
-    # Try to auto-start Docker Desktop
-    $dockerDesktop = "${env:ProgramFiles}\Docker\Docker\Docker Desktop.exe"
-    if (Test-Path $dockerDesktop) {
-        Write-Host "Attempting to start Docker Desktop..." -ForegroundColor Yellow
-        Start-Process $dockerDesktop
-        Write-Host "Docker Desktop is starting. Wait for it to finish, then re-run this script." -ForegroundColor Yellow
-    }
-    exit 1
+# ── Helper: re-launch self as admin ──
+function Invoke-Elevated {
+    param([string]$Reason)
+    Write-Host "  Requesting admin privileges: $Reason" -ForegroundColor Yellow
+    $scriptUrl = "https://raw.githubusercontent.com/robit-man/oa-install/main/install.ps1"
+    # Pass env vars through to elevated process
+    $envBlock = "`$env:OA_MODEL='$OA_MODEL'; `$env:OA_VERSION='$OA_VERSION'; `$env:OA_WORKSPACE='$OA_WORKSPACE'; "
+    $cmd = "$envBlock irm $scriptUrl | iex"
+    Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $cmd -Wait
+    exit 0
 }
 
-# ── Step 3: Check NVIDIA GPU ──
+Write-Host ""
+Write-Host "  Open Agents - Automatic Installer (Windows)" -ForegroundColor Cyan
+Write-Host "  ============================================" -ForegroundColor Cyan
+Write-Host ""
+
+# ═══════════════════════════════════════════════════════════
+# PHASE 1: WSL2
+# ═══════════════════════════════════════════════════════════
+
+Write-Host "[1/8] Checking WSL2..." -ForegroundColor Yellow
+$wslInstalled = $false
+try {
+    $wslOut = wsl --status 2>&1 | Out-String
+    if ($wslOut -match "Default Version: 2" -or $wslOut -match "WSL version: 2" -or $wslOut -match "WSL 2") {
+        $wslInstalled = $true
+        Write-Host "  WSL2: installed" -ForegroundColor Green
+    }
+} catch {}
+
+if (-not $wslInstalled) {
+    Write-Host "  WSL2 not ready — installing..." -ForegroundColor Yellow
+    if (-not (Test-Admin)) {
+        Invoke-Elevated "Install WSL2"
+    }
+    # Enable WSL + Virtual Machine Platform
+    try {
+        dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart 2>$null | Out-Null
+        dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart 2>$null | Out-Null
+    } catch {}
+    # Install/update WSL
+    try {
+        wsl --install --no-distribution 2>$null | Out-Null
+        wsl --update 2>$null | Out-Null
+        wsl --set-default-version 2 2>$null | Out-Null
+    } catch {}
+    Write-Host "  WSL2: installed (reboot may be needed if this is the first time)" -ForegroundColor Green
+}
+
+# ═══════════════════════════════════════════════════════════
+# PHASE 2: Docker Desktop
+# ═══════════════════════════════════════════════════════════
+
+Write-Host "[2/8] Checking Docker Desktop..." -ForegroundColor Yellow
+
+$dockerCliExists = $false
+try {
+    $null = Get-Command docker -ErrorAction Stop
+    $dockerCliExists = $true
+} catch {}
+
+if (-not $dockerCliExists) {
+    Write-Host "  Docker not found — downloading Docker Desktop installer..." -ForegroundColor Yellow
+
+    $installerPath = Join-Path $env:TEMP "DockerDesktopInstaller.exe"
+    $dockerUrl = "https://desktop.docker.com/win/main/amd64/Docker%20Desktop%20Installer.exe"
+
+    try {
+        Invoke-WebRequest -Uri $dockerUrl -OutFile $installerPath -UseBasicParsing
+    } catch {
+        Write-Host "  ERROR: Failed to download Docker Desktop." -ForegroundColor Red
+        Write-Host "  Download manually from: https://docs.docker.com/desktop/install/windows-install/" -ForegroundColor Yellow
+        exit 1
+    }
+
+    Write-Host "  Installing Docker Desktop (this takes 1-3 minutes)..." -ForegroundColor Yellow
+    if (-not (Test-Admin)) {
+        Invoke-Elevated "Install Docker Desktop"
+    }
+    Start-Process -FilePath $installerPath -ArgumentList "install", "--quiet", "--accept-license" -Wait
+    Remove-Item $installerPath -ErrorAction SilentlyContinue
+
+    # Refresh PATH after Docker install
+    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = "$machinePath;$userPath"
+
+    Write-Host "  Docker Desktop: installed" -ForegroundColor Green
+}
+
+$dockerVersion = (docker --version 2>&1) | Out-String
+Write-Host "  $($dockerVersion.Trim())" -ForegroundColor Green
+
+# ═══════════════════════════════════════════════════════════
+# PHASE 3: Start Docker daemon and wait
+# ═══════════════════════════════════════════════════════════
+
+Write-Host "[3/8] Ensuring Docker daemon is running..." -ForegroundColor Yellow
+
+function Test-DockerDaemon {
+    try {
+        $out = docker info 2>&1 | Out-String
+        return ($out -notmatch "error|Cannot connect|pipe|not running")
+    } catch { return $false }
+}
+
+if (-not (Test-DockerDaemon)) {
+    Write-Host "  Docker daemon not running — starting Docker Desktop..." -ForegroundColor Yellow
+
+    # Find Docker Desktop exe
+    $dockerDesktopPaths = @(
+        "${env:ProgramFiles}\Docker\Docker\Docker Desktop.exe",
+        "${env:ProgramFiles(x86)}\Docker\Docker\Docker Desktop.exe",
+        "$env:LOCALAPPDATA\Docker\Docker Desktop.exe"
+    )
+    $dockerExe = $null
+    foreach ($p in $dockerDesktopPaths) {
+        if (Test-Path $p) { $dockerExe = $p; break }
+    }
+
+    if ($dockerExe) {
+        Start-Process $dockerExe -WindowStyle Minimized
+    } else {
+        # Try via start menu shortcut
+        try { Start-Process "Docker Desktop" -ErrorAction Stop } catch {
+            Write-Host "  Cannot find Docker Desktop executable. Please start it manually." -ForegroundColor Red
+            exit 1
+        }
+    }
+
+    # Wait up to 120 seconds for daemon to be ready
+    Write-Host "  Waiting for Docker engine to start " -NoNewline -ForegroundColor Yellow
+    $maxWait = 120
+    $waited = 0
+    while ($waited -lt $maxWait) {
+        if (Test-DockerDaemon) { break }
+        Write-Host "." -NoNewline -ForegroundColor Yellow
+        Start-Sleep -Seconds 3
+        $waited += 3
+    }
+    Write-Host ""
+
+    if (-not (Test-DockerDaemon)) {
+        Write-Host "  ERROR: Docker daemon did not start within ${maxWait}s." -ForegroundColor Red
+        Write-Host "  Try restarting your computer, then run this script again." -ForegroundColor Yellow
+        exit 1
+    }
+}
+
+Write-Host "  Docker daemon: running" -ForegroundColor Green
+
+# ═══════════════════════════════════════════════════════════
+# PHASE 4: GPU detection
+# ═══════════════════════════════════════════════════════════
+
+Write-Host "[4/8] Detecting GPU..." -ForegroundColor Yellow
 $GPU_FLAGS = ""
 try {
     $gpuName = (nvidia-smi --query-gpu=name --format=csv,noheader 2>$null) | Select-Object -First 1
     if ($gpuName) {
-        Write-Host "GPU: $gpuName" -ForegroundColor Green
+        $gpuVram = (nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>$null) | Select-Object -First 1
+        Write-Host "  GPU: $gpuName (${gpuVram}MB VRAM)" -ForegroundColor Green
         $GPU_FLAGS = "--gpus all"
     } else {
-        Write-Host "GPU: not detected (CPU-only mode)" -ForegroundColor Yellow
+        Write-Host "  GPU: none detected (CPU-only mode)" -ForegroundColor Yellow
     }
 } catch {
-    Write-Host "GPU: not detected (CPU-only mode)" -ForegroundColor Yellow
+    Write-Host "  GPU: none detected (CPU-only mode)" -ForegroundColor Yellow
 }
 
-# ── Step 4: Create workspace ──
-New-Item -ItemType Directory -Path $OA_WORKSPACE -Force | Out-Null
-Write-Host "Workspace: $OA_WORKSPACE" -ForegroundColor Green
+# ═══════════════════════════════════════════════════════════
+# PHASE 5: Workspace
+# ═══════════════════════════════════════════════════════════
 
-# ── Step 5: Download build files ──
-Write-Host "`nDownloading build files..." -ForegroundColor Cyan
+Write-Host "[5/8] Creating workspace..." -ForegroundColor Yellow
+New-Item -ItemType Directory -Path $OA_WORKSPACE -Force | Out-Null
+Write-Host "  Workspace: $OA_WORKSPACE" -ForegroundColor Green
+
+# ═══════════════════════════════════════════════════════════
+# PHASE 6: Build Docker image
+# ═══════════════════════════════════════════════════════════
+
+Write-Host "[6/8] Building OA Docker image..." -ForegroundColor Yellow
+
 $tmpDir = Join-Path $env:TEMP "oa-install-$(Get-Date -Format 'yyyyMMddHHmmss')"
 New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 $repoUrl = "https://raw.githubusercontent.com/robit-man/oa-install/main"
@@ -95,34 +220,32 @@ try {
     Invoke-WebRequest -Uri "$repoUrl/Dockerfile" -OutFile "$tmpDir\Dockerfile" -UseBasicParsing
     Invoke-WebRequest -Uri "$repoUrl/entrypoint.sh" -OutFile "$tmpDir\entrypoint.sh" -UseBasicParsing
 } catch {
-    Write-Host "ERROR: Failed to download build files." -ForegroundColor Red
-    Write-Host "Check your internet connection and try again." -ForegroundColor Yellow
+    Write-Host "  ERROR: Failed to download build files. Check internet connection." -ForegroundColor Red
     Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
     exit 1
 }
 
-# ── Step 6: Build Docker image ──
-Write-Host "Building OA Docker image (this may take 2-5 minutes on first run)..." -ForegroundColor Cyan
-try {
-    docker build --build-arg OA_VERSION=$OA_VERSION -t $IMAGE_NAME "$tmpDir"
-    if ($LASTEXITCODE -ne 0) { throw "Docker build failed with exit code $LASTEXITCODE" }
-    Write-Host "Docker image built successfully." -ForegroundColor Green
-} catch {
-    Write-Host ""
-    Write-Host "ERROR: Docker build failed." -ForegroundColor Red
-    Write-Host ""
-    Write-Host "Common fixes:" -ForegroundColor Yellow
-    Write-Host "  1. Make sure Docker Desktop is fully started (whale icon = steady, not animating)" -ForegroundColor White
-    Write-Host "  2. In Docker Desktop Settings > General, ensure 'Use the WSL 2 based engine' is checked" -ForegroundColor White
-    Write-Host "  3. In Docker Desktop Settings > Resources > WSL Integration, enable your distro" -ForegroundColor White
-    Write-Host "  4. Try: docker run hello-world (if this fails, Docker itself has an issue)" -ForegroundColor White
-    Write-Host ""
+Write-Host "  Building image (2-5 min on first run)..." -ForegroundColor Yellow
+docker build --build-arg OA_VERSION=$OA_VERSION -t $IMAGE_NAME "$tmpDir" 2>&1 | ForEach-Object {
+    if ($_ -match "^Step|^Successfully|^#\d+ DONE") { Write-Host "  $_" -ForegroundColor DarkGray }
+}
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "  ERROR: Docker build failed." -ForegroundColor Red
+    Write-Host "  Try: docker run hello-world  — if that fails, Docker itself has an issue." -ForegroundColor Yellow
     Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
     exit 1
 }
+
 Remove-Item -Recurse -Force $tmpDir -ErrorAction SilentlyContinue
+Write-Host "  Docker image: built" -ForegroundColor Green
 
-# ── Step 7: Create launcher ──
+# ═══════════════════════════════════════════════════════════
+# PHASE 7: Create launcher
+# ═══════════════════════════════════════════════════════════
+
+Write-Host "[7/8] Creating oa-docker launcher..." -ForegroundColor Yellow
+
 $launcherDir = "$env:USERPROFILE\.local\bin"
 New-Item -ItemType Directory -Path $launcherDir -Force | Out-Null
 $launcherPath = "$launcherDir\oa-docker.cmd"
@@ -133,37 +256,35 @@ set IMAGE_NAME=open-agents
 set CONTAINER_NAME=oa
 if "%OA_WORKSPACE%"=="" set OA_WORKSPACE=%USERPROFILE%\oa-workspace
 if "%OA_MODEL%"=="" set OA_MODEL=qwen3:4b
-
-REM Stop existing container if running
 docker rm -f %CONTAINER_NAME% >nul 2>&1
-
-REM Detect GPU
 set GPU_FLAGS=
 nvidia-smi >nul 2>&1 && set GPU_FLAGS=--gpus all
-
-REM Launch container
 docker run -it --rm --name %CONTAINER_NAME% %GPU_FLAGS% -p 11434:11434 -p 11435:11435 -e OA_MODEL=%OA_MODEL% -e TERM=xterm-256color -e COLORTERM=truecolor -v %OA_WORKSPACE%:/workspace -v %USERPROFILE%\.ollama:/root/.ollama -v %USERPROFILE%\.open-agents:/root/.open-agents %IMAGE_NAME% %*
 "@ | Out-File -Encoding ASCII $launcherPath
 
-# ── Step 8: Add to PATH ──
+# Add to user PATH
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
 if ($currentPath -notlike "*$launcherDir*") {
     [Environment]::SetEnvironmentVariable("Path", "$launcherDir;$currentPath", "User")
     $env:Path = "$launcherDir;$env:Path"
-    Write-Host "Added $launcherDir to PATH" -ForegroundColor Green
 }
 
-# ── Step 9: Success! ──
+Write-Host "  Launcher: $launcherPath" -ForegroundColor Green
+
+# ═══════════════════════════════════════════════════════════
+# PHASE 8: Launch
+# ═══════════════════════════════════════════════════════════
+
+Write-Host "[8/8] Launching Open Agents..." -ForegroundColor Yellow
 Write-Host ""
-Write-Host "  Installation Complete!" -ForegroundColor Green
-Write-Host "  =====================" -ForegroundColor Green
+Write-Host "  ==============================================" -ForegroundColor Green
+Write-Host "     Installation Complete!" -ForegroundColor Green
+Write-Host "  ==============================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "  Launch OA:   oa-docker" -ForegroundColor Cyan
-Write-Host "  API mode:    oa-docker oa serve" -ForegroundColor Cyan
-Write-Host "  Shell:       oa-docker bash" -ForegroundColor Cyan
-Write-Host "  Workspace:   $OA_WORKSPACE" -ForegroundColor Cyan
+Write-Host "  Next time, just run:  oa-docker" -ForegroundColor Cyan
+Write-Host "  API mode:             oa-docker oa serve" -ForegroundColor Cyan
+Write-Host "  Shell:                oa-docker bash" -ForegroundColor Cyan
+Write-Host "  Workspace:            $OA_WORKSPACE" -ForegroundColor Cyan
 Write-Host ""
 
-# ── Step 10: Launch ──
-Write-Host "Starting OA..." -ForegroundColor Yellow
 & $launcherPath

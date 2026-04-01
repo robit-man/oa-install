@@ -51,22 +51,58 @@ else
   echo -e "${YELLOW}Installing Docker...${NC}"
   case "$OS" in
     Linux)
-      curl -fsSL https://get.docker.com | sh
+      curl -fsSL https://get.docker.com | sudo sh
       sudo systemctl enable --now docker
       sudo usermod -aG docker "$USER"
-      echo -e "${YELLOW}NOTE: You may need to log out and back in for Docker group permissions.${NC}"
+      # Apply group immediately without requiring re-login
       ;;
     Darwin)
-      echo -e "${RED}Docker Desktop required on macOS.${NC}"
-      echo "Download from: https://docs.docker.com/desktop/install/mac-install/"
-      echo "After installing Docker Desktop, re-run this script."
-      exit 1
+      echo -e "${YELLOW}Installing Docker Desktop via Homebrew...${NC}"
+      if ! command -v brew &>/dev/null; then
+        echo -e "${YELLOW}Installing Homebrew first...${NC}"
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null)"
+      fi
+      brew install --cask docker
+      echo -e "${YELLOW}Starting Docker Desktop...${NC}"
+      open -a Docker
+      echo -e "${YELLOW}Waiting for Docker daemon to start (up to 90s)...${NC}"
+      for i in $(seq 1 30); do
+        if docker info &>/dev/null 2>&1; then break; fi
+        sleep 3
+        printf "."
+      done
+      echo ""
+      if ! docker info &>/dev/null 2>&1; then
+        echo -e "${RED}Docker daemon did not start. Open Docker Desktop manually, then re-run this script.${NC}"
+        exit 1
+      fi
+      echo -e "${GREEN}Docker Desktop: running${NC}"
       ;;
     *)
       echo -e "${RED}Unsupported OS: $OS${NC}"
       exit 1
       ;;
   esac
+fi
+
+# ── Docker command wrapper: use sudo if user not in docker group ──
+DOCKER="docker"
+if [ "$OS" = "Linux" ] && ! docker info &>/dev/null 2>&1; then
+  if sudo docker info &>/dev/null 2>&1; then
+    DOCKER="sudo docker"
+    echo -e "${YELLOW}Using sudo for Docker (group membership applies on next login)${NC}"
+  else
+    # Try starting the daemon
+    sudo systemctl start docker 2>/dev/null
+    sleep 2
+    if sudo docker info &>/dev/null 2>&1; then
+      DOCKER="sudo docker"
+    else
+      echo -e "${RED}Docker daemon failed to start. Try: sudo systemctl start docker${NC}"
+      exit 1
+    fi
+  fi
 fi
 
 # ── Step 2: NVIDIA Container Toolkit (Linux + GPU) ──
@@ -121,7 +157,7 @@ else
   BUILD_DIR="$TMPDIR"
 fi
 
-docker build \
+$DOCKER build \
   --build-arg OA_VERSION="$OA_VERSION" \
   -t "$IMAGE_NAME" \
   "$BUILD_DIR"
@@ -148,8 +184,14 @@ if command -v nvidia-smi &>/dev/null && [ "$(uname -s)" = "Linux" ]; then
   GPU_FLAGS="--gpus all"
 fi
 
+# Docker command — use sudo if needed
+DOCKER="docker"
+if [ "$(uname -s)" = "Linux" ] && ! docker info &>/dev/null 2>&1; then
+  DOCKER="sudo docker"
+fi
+
 # Stop existing container if running
-docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+$DOCKER rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
 # Use --network host on Linux (fastest), port mapping elsewhere (macOS/WSL)
 NETWORK_FLAGS="--network host"
@@ -157,7 +199,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
   NETWORK_FLAGS="-p 11434:11434 -p 11435:11435"
 fi
 
-exec docker run -it --rm \
+exec $DOCKER run -it --rm \
   --name "$CONTAINER_NAME" \
   $GPU_FLAGS \
   $NETWORK_FLAGS \
