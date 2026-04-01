@@ -151,10 +151,16 @@ fi
 # Stop existing container if running
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
+# Use --network host on Linux (fastest), port mapping elsewhere (macOS/WSL)
+NETWORK_FLAGS="--network host"
+if [ "$(uname -s)" = "Darwin" ]; then
+  NETWORK_FLAGS="-p 11434:11434 -p 11435:11435"
+fi
+
 exec docker run -it --rm \
   --name "$CONTAINER_NAME" \
   $GPU_FLAGS \
-  --network host \
+  $NETWORK_FLAGS \
   -e "OA_MODEL=$OA_MODEL" \
   -e "TERM=$TERM" \
   -e "COLORTERM=${COLORTERM:-truecolor}" \
