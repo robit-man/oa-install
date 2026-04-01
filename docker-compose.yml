@@ -1,0 +1,27 @@
+services:
+  oa:
+    build:
+      context: .
+      args:
+        OA_VERSION: latest
+    image: open-agents
+    container_name: oa
+    stdin_open: true
+    tty: true
+    network_mode: host
+    environment:
+      - OA_MODEL=${OA_MODEL:-qwen3:4b}
+      - TERM=xterm-256color
+      - COLORTERM=truecolor
+    volumes:
+      - ${OA_WORKSPACE:-./workspace}:/workspace
+      - ${HOME}/.ollama:/root/.ollama
+      - ${HOME}/.open-agents:/root/.open-agents
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
